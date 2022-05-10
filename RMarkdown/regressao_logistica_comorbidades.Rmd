@@ -1,0 +1,946 @@
+---
+title: "Regressão Logística e validação de suposições"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Import
+Importanto bibliotecas
+```{r Bibliotecas}
+library(data.table)
+library(tidyverse)
+library(recipes)
+library(customsteps)
+library(arrow)
+library(explore)
+library(car)
+library(ggplot2)
+library(dbscan)
+library(scales)
+library(caret)
+library(ROCR)
+library(cluster)
+library(FastKNN)
+```
+
+
+
+Lendo arquivo para aplicação da regressão
+```{r Import dos dados}
+
+comorbidades_regressao <- as.data.table(read_parquet("../data/interim/comorbidades_regressao.parquet"))
+comorbidade_regressao_simples_total <- as.data.table(
+                                                read_parquet("../data/interim/comorbidades_regressao_nao_duplicatas_simples.parquet")
+                                                )
+comorbidade_regressao_simples_copia <- copy(comorbidade_regressao_simples_total)
+df_comor_simples <- as.data.table(read_parquet("../data/interim/comorbidade_simples.parquet"))
+```
+
+Separando os dados em treino e teste do modelo
+```{r Separação em dados de treino e teste}
+set.seed(412)
+index_treino <- createDataPartition(comorbidade_regressao_simples_total$obito_pre,p = .7,list = F)
+comorbidade_regressao_simples <- comorbidade_regressao_simples_total[index_treino]
+comorbidade_regressao_simples_teste <- comorbidade_regressao_simples_total[-index_treino]
+```
+
+
+Este arquivo importado possui classes de caracteres, então vamos fazer a conversão para factor do Python
+```{r Describe dos dados de treino sem nenhuma transformação}
+describe(comorbidade_regressao_simples)
+```
+# Tratamento dos dados
+Conversão em factor
+```{r Conversão em fator}
+colunas_factor <- as.data.table(describe(comorbidade_regressao_simples))[type == "chr",]$variable
+comorbidade_regressao_simples[,(colunas_factor) := lapply(.SD, 
+                                                          function(x){
+                                                              as.factor(x)
+                                                          }),
+                              .SDcols = colunas_factor,
+                             ][,c("__index_level_0__") := NULL]
+
+comorbidade_regressao_simples[,obito_pre := factor(obito_pre,levels = c(0,1), labels = c("vivo","morto"))]
+```
+
+Por conta da remoção das duplicatas (a maioria dos pacientes teve suas comorbidades ignoradas, portanto, as únicas variáveis que alterariam seriam o desfecho do paciente e sua idade ), os casos com desfechos de óbito e não óbito são quase iguais
+```{r Plot da distribuição de desfechos}
+ggplot(comorbidade_regressao_simples) + geom_bar(aes(x = obito_pre)) + ggtitle("Quantidade de mortes da base")
+```
+```{r }
+comorbidade_regressao_simples[,.N,by = .(obito_pre)
+                             ][,.("obito_pre" = get("obito_pre"),
+                                  "percentual" = N/sum(N))]
+```
+
+
+
+Agora, só precisamos normalizar os dados da idade
+```{r}
+describe(comorbidade_regressao_simples)
+```
+```{r}
+ss <- scale(comorbidade_regressao_simples$idade_pre)
+comorbidade_regressao_simples$idade_pre <- ss
+
+desvio <- attributes(ss)$`scaled:scale` 
+media <- attributes(ss)$`scaled:center`
+```
+
+Criando o Pipeline por meio das recipes
+```{r}
+
+pipeline <- recipe(x=comorbidade_regressao_simples_total[index_treino])%>%
+                step_rm("__index_level_0__") %>%
+                  step_string2factor(-c("idade_pre","obito_pre")) %>%
+                    step_normalize("idade_pre") %>%
+                    step_num2factor("obito_pre",transform = function(x) x + 1,levels = c("vivo","morto"))
+
+
+```
+
+# Primeiro modelo
+Criando o primeiro modelo, utilizando todas as variáveis
+```{r}
+log_reg <- glm(formula = obito_pre ~ .,
+               family = binomial(link="logit"),
+               data = comorbidade_regressao_simples,
+               x = T)
+summary(log_reg)
+```
+Vamos aplicar o método VIF para verificar também a colinearidade entre as variáveis
+```{r}
+vif(log_reg)
+```
+
+
+Vamos ver como foram os resultados na base de treinamento
+```{r Matriz de confusão da base de treino}
+treino.prob <- predict(log_reg,comorbidade_regressao_simples,type = "response")
+limiar <- 0.5
+
+confusionMatrix(data = factor(as.integer(treino.prob > limiar),levels = c(0,1), labels = c("vivo","morto")),
+                reference = comorbidade_regressao_simples$obito_pre,
+                positive = "morto",
+                mode = "everything")
+```
+
+
+
+```{r Matriz de Confusão da base de teste}
+teste <- as.data.table(pipeline%>%prep()%>%bake(comorbidade_regressao_simples_teste))
+
+matriz_confusao <- function(df,modelo,threshold = 0.5){
+  df.prob <- predict(modelo,df,type = "response")
+
+  return(confusionMatrix(data = factor(as.integer(df.prob > threshold),levels = c(0,1), labels = c("vivo","morto")),
+                reference = df$obito_pre,
+                positive = "morto",
+                mode = "everything"))
+}
+matriz_confusao(teste,log_reg,limiar)
+
+```
+
+Curva ROC
+```{r Curva ROC}
+
+calcula_roc <- function(df,modelo,threshold = 0.5){
+     p <- predict(modelo,df,type = "response")
+     
+     pr <- prediction(predictions = p, 
+                       labels = df$obito_pre,
+                       label.ordering = c("vivo","morto"))
+      
+     prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+     
+     auc <- performance(pr, measure = "auc")
+     print(paste("AUC = ",round(auc@y.values[[1]],3),sep=" "))
+     plot(prf)
+}
+
+
+
+calcula_roc(df = teste,modelo = log_reg)
+```
+
+# Análise residual e de influência do primeiro modelo
+
+Para este modelo, vamos fazer uma análise de influência. Com a função *influenceIndexPlot* temos a criação de 3 diferentes visões:
+
+* a primeira, trata-se da distância de Cook, que basicamente representa quais são as amostras que mais influenciam o modelo
+* O último gráfico, hat-value, evidência valores que podemos considerar anômalos e impactam diretamente o resultado da modelagem. No caso, fica evidente que o indivíduo da linha 25668 pode ser considerado um ponto de alavanca.
+
+doi: 10.21037/atm.2016.03.36
+
+```{r Gráfcio de influência}
+influenceIndexPlot(log_reg)
+```
+Neste gráfico, temos os resíduos studentizados no eixo y (quanto maior seu valor, mais provável de ser um outlier), o hat-value no eixo x e o tamanho do círculo representa a distância de Cook (maior o raio, maior a distância). Vemos, portanto, que existe um indivíduo que está bem fora do padrão (o mesmo 17963)
+```{r Gráfico de influência 2}
+influencePlot(log_reg,col='red')
+```
+Este indivíduo é aquele que não morreu, mas possui várias comorbidades (provavelmente trata-se de um erro)
+```{r Ponto de alavancagem}
+comorbidade_regressao_simples[17963,]
+```
+Vejamos se existem outros casos de indivíduos que possuem a sindrome e no campo "puérpera", foram classificados como "sim"
+```{r}
+#São os dois os indivíduos na base de treino que estão equivocados. Necessitaremos removê-los em modelos futuros
+linhas_outlier <- comorbidade_regressao_simples[,.I[puerpera_pre == 'sim' & sindrome_de_down_pre == 'sim']]
+comorbidade_regressao_simples[puerpera_pre == 'sim' & sindrome_de_down_pre == 'sim',]
+```
+
+
+Podemos montar o gráfico de influência da seguinte forma, com o auxilio do ggplot2 
+```{r Gráfico de influência com ggplot2}
+grafico_influencia <- function(model,size=TRUE){
+          df_influencia <- data.table(residuo_stud = rstudent(model),
+                                 hatvalue = hatvalues((model)),
+                                 cook = cooks.distance(model))
+          if(size == TRUE){
+            plotagem <- ggplot(df_influencia) + geom_point(aes(x = hatvalue, y=residuo_stud, size = cook),alpha = 0.3)
+          }else{
+            plotagem <- ggplot(df_influencia) + geom_point(aes(x = hatvalue, y=residuo_stud),alpha = 0.3)
+          }
+            
+          return(list("df_influencia" = df_influencia,
+                      "plot" = plotagem))
+}
+result <- grafico_influencia(log_reg)
+influ_df <- result$df_influencia
+result$plot
+
+```
+Nota-se a presença de grupos distintos no gráfico acima de influência. Vamos fazer uma clusterização para montar grupos e criar algumas estatíticas básicas.
+Utilizaremos o algorimo DBScan para fazer o agrupamento, mas para termos eficiencia no método, precisamos, primeiramente, normalizar os dados, para que estejam na mesma escala
+```{r Gráfico de influência normalizado}
+normalize <- function(x, na.rm = TRUE) {
+    return((x- min(x)) /(max(x)-min(x)))
+}
+
+influ_df[,`:=`(hatvalue_ = normalize(hatvalue),residuo_stud_ = normalize(residuo_stud))]
+ggplot(influ_df) + geom_point(aes(x = hatvalue_, y=residuo_stud_),alpha = 0.3)
+```
+
+```{r}
+arm::binnedplot(predict(log_reg),resid(log_reg,type = "response"),main = "Binned Plot do primeiro modelo")
+```
+```{r}
+arm::binnedplot(comorbidade_regressao_simples$idade_pre,residuals(log_reg,type = "response"),
+                nclass = 2000,main = "Binned Plot para a idade")
+```
+
+
+
+## Análise de clusters do gráfico de resíduo por influência
+O resultado do modelo DBScan é apresentado abaixo
+```{r DBScan dos resíduos}
+db_result <- dbscan(x = as.matrix(influ_df[,.(hatvalue_,residuo_stud_)]), eps = 0.0233)
+ggplot(influ_df) + geom_point(aes(x = hatvalue_, y=residuo_stud_, color = as.factor(db_result$cluster)),alpha = 0.3) +
+  guides(color=guide_legend(title="Cluster"))
+```
+
+
+
+O modelo DBScan classificou alguns pontos (classificados no grupo 0) como outlier. Dessa forma, vamos considerar os grupos que são nítidos, visivelmente (6 grupos)
+```{r Remoção dos pontos outlier da clusterização dos resíduos}
+#Visualmente, iremos contruir 6 grupos
+influ_df[,cluster := db_result$cluster]
+ggplot(influ_df[(cluster <= 5 & cluster != 0) | 
+                (cluster == 9  | cluster == 6   | cluster == 7 | cluster == 11 | cluster == 10) | 
+                ( cluster == 12| cluster == 8)]) + 
+  geom_point(aes(x = hatvalue_, y=residuo_stud_, color = as.factor(cluster)),alpha = 0.3) +
+  guides(color=guide_legend(title="Cluster"))
+```
+
+
+Os 6 grupos podem ser vistos no gráfico abaixo
+```{r Ajuste dos grupos}
+cores <- hue_pal()(length(
+                  unique(
+                    influ_df[(cluster <= 5 & cluster != 0) | 
+                              (cluster == 9  | cluster == 6   | cluster == 7 | cluster == 11 | cluster == 10) | 
+                              ( cluster == 12| cluster == 8)]$cluster
+                      )
+                  ))
+comorbidade_regressao_simples[,cluster := db_result$cluster,
+                             ][,cluster := fifelse(cluster == 8 | cluster == 6| cluster == 10,
+                                                   -1,
+                                                   fifelse((cluster == 9 | cluster == 7),
+                                                           -2,
+                                                           fifelse(cluster == 5,
+                                                                   3,
+                                                                   cluster)))]
+
+influ_df[,cluster := db_result$cluster,
+       ][,cluster := fifelse(cluster == 8 | cluster == 6| cluster == 10,
+                                                   -1,
+                                                   fifelse((cluster == 9 | cluster == 7),
+                                                           -2,
+                                                           fifelse(cluster == 5,
+                                                                   3,
+                                                                   cluster)))
+       ][,obito_pre := comorbidade_regressao_simples$obito_pre]
+
+
+ggplot(influ_df[(cluster != 0)]) + 
+  geom_point(aes(x = hatvalue_, y=residuo_stud_, color = as.factor(cluster)),alpha = 0.3) +
+    scale_color_manual(values = c(cores[5],cores[9],cores[1],cores[2],cores[3],cores[4])) +
+       guides(color=guide_legend(title="Clusters"))
+```
+O grupo abaixo do valor 0.5 para os resíduos são todos aqueles que não morreram (em vermelho), enquanto que os acima (em azul), são aqueles que morreram
+```{r Verificação da distribuição dos valores reais de vivos e mortos}
+ggplot(influ_df[(cluster  != 0)]) + 
+  geom_point(aes(x = hatvalue_, y=residuo_stud_, color = as.factor(obito_pre)),alpha = 0.3) +
+     guides(color=guide_legend(title="Desfecho"))
+```
+Os clusters que separamos, é composto em grande parte, de pessoas que viveram
+```{r Distribuição da predição nos resíduos}
+ggplot(influ_df[(cluster  != 0)]) + 
+  geom_point(aes(x = hatvalue_, 
+                 y=residuo_stud_, 
+                 color = factor(as.integer(predict(log_reg,
+                                                   comorbidade_regressao_simples[(cluster  != 0)],
+                                                   type = "response") > limiar),levels = c(0,1), labels = c("vivo","morto"))),
+             alpha = 0.3)  + guides(color=guide_legend(title="Desfecho"))
+
+```
+```{r}
+ggplot(influ_df[(cluster  != 0)]) + 
+  geom_point(aes(x = hatvalue_, 
+                 y=residuo_stud_),
+             alpha = 0.3)  + guides(color=guide_legend(title="Desfecho")) + 
+    facet_wrap(factor(as.integer(predict(log_reg,
+                       comorbidade_regressao_simples[(cluster  != 0)],
+                       type = "response") > limiar),levels = c(0,1), labels = c("vivo","morto")))
+```
+```{r}
+ggplot(data.table(pred = predict(log_reg,comorbidade_regressao_simples,type = "response"),
+                real = comorbidade_regressao_simples$obito_pre)) + geom_histogram(aes(x = pred)) + facet_wrap("real")
+
+```
+
+Vamos verificar, se por meio de uma clusterização, podemos encontrar alguma relação. Vamos utilizar de uma clusterização hierarquica, pois assim, podemos ver diferentes quantidade de clusters.
+Contudo,o volume de dados que tem, não nos permite realizar a clusterização em tempo ábil. Portanto, vamos fazer uma amostragem e reduzir a base de dados em 40%
+```{r}
+#Verificando a quantidade de dados para cada conjunto de cluster
+comorbidade_regressao_simples[,.N,by=.(cluster)]
+```
+## Inclusão dos clusters no modelo de regressão
+Os clusters 1 e 2 são os mais populosos, por isso, vamos fazer uma redução nesses casos
+```{r}
+perc_reducao <- 0.7
+
+gera_ind_amostra_cluster <- function(df,perc_red){
+      df[,index := 1:nrow(df)]
+  
+      ind1 <- createDataPartition(df[cluster == 1]$index,p=1-perc_red,list=F)
+      ind2 <- createDataPartition(df[cluster == 2]$index,p=1-perc_red,list=F)
+      indn <- df[cluster != 1 & cluster != 2]$index
+      return(c(df[cluster == 1,][ind1]$index,
+               df[cluster == 2,][ind2]$index,
+               indn))
+}
+ind_amostra_cluster <- gera_ind_amostra_cluster(comorbidade_regressao_simples,perc_reducao)
+amostra_cluster <- comorbidade_regressao_simples[ind_amostra_cluster,]
+influ_df_amostra_cluster <- influ_df[ind_amostra_cluster,] 
+
+influ_df_amostra_cluster[,.N,by=.(cluster)]
+
+ggplot(influ_df_amostra_cluster[(cluster != 0)]) + 
+  geom_point(aes(x = hatvalue_, y=residuo_stud_, color = as.factor(cluster)),alpha = 0.3) +
+    scale_color_manual(values = c(cores[5],cores[9],cores[1],cores[2],cores[3],cores[4])) +
+       guides(color=guide_legend(title="Clusters"))
+
+```
+Clusterização dos dados
+```{r Clusterização}
+dissimilaridade <- daisy(x = amostra_cluster[,-c("cluster","obito_pre")],metric = "gower")
+if(length(list.files("../data/interim/clusterizacao_r/")) == 0){
+  clusterizacao_ward <- agnes(dissimilaridade, method = "ward")
+  clusterizacao_average <- agnes(dissimilaridade, method = "average")
+  clusterizacao_complete <- agnes(dissimilaridade, method = "complete")
+  clusterizacao_single <- agnes(dissimilaridade, method = "single")
+  
+  saveRDS(clusterizacao_ward,file = "../data/interim/clusterizacao_r/clusterizacao_ward.RData")
+  saveRDS(clusterizacao_average,file = "../data/interim/clusterizacao_r/clusterizacao_average.RData")
+  saveRDS(clusterizacao_complete,file = "../data/interim/clusterizacao_r/clusterizacao_complete.RData")
+  saveRDS(clusterizacao_single,file = "../data/interim/clusterizacao_r/clusterizacao_single.RData")
+}else{
+  clusterizacao_ward <- readRDS("../data/interim/clusterizacao_r/clusterizacao_ward.RData")
+  clusterizacao_average <- readRDS("../data/interim/clusterizacao_r/clusterizacao_average.RData")
+  clusterizacao_complete <- readRDS("../data/interim/clusterizacao_r/clusterizacao_complete.RData")
+  clusterizacao_single <- readRDS("../data/interim/clusterizacao_r/clusterizacao_single.RData")
+}
+```
+
+Apresentação dos dendogramas
+```{r Dendogramas}
+pltree(clusterizacao_ward)
+```
+```{r}
+pltree(clusterizacao_single)
+```
+```{r}
+pltree(clusterizacao_average)
+```
+```{r}
+pltree(clusterizacao_complete)
+```
+
+O dendograma que apresenta a maior homogeneidade (níveis mais altos na hierarquia apresentam um número razoável de registros) dentro do dendograma o método ward. Vamos utilizá-lo
+```{r}
+influ_df_amostra_cluster$agnes_ <- cutree(clusterizacao_ward,k=40)
+
+influ_df_amostra_cluster[,.N,by = .(agnes_),
+                        ][,.(agnes_,perc_pontos = 100*N/sum(N))]
+
+ggplot(influ_df_amostra_cluster[(cluster != 0)]) + 
+  geom_point(aes(x = hatvalue_, y=residuo_stud_),alpha = 0.3) +
+       guides(color=guide_legend(title="Clusters")) +  facet_wrap("agnes_")
+```
+```{r}
+knn_prediction <- function(dataset_treino,dataset_teste,label,k=3){
+  
+  distancia <- as.matrix(daisy(rbind(dataset_treino,dataset_teste),metric = "gower"))
+  
+  return(knn_test_function(dataset_treino,dataset_teste,distancia,label,k=k))
+}
+
+rotulo1 <- fifelse(influ_df_amostra_cluster$agnes_ == 2 | 
+                     influ_df_amostra_cluster$agnes_ == 6 | 
+                     influ_df_amostra_cluster$agnes_ >= 38,
+                   1,
+                   2)
+result_knn <- knn_prediction(amostra_cluster[,-c("cluster","obito_pre")],
+               amostra_cluster[,-c("cluster","obito_pre")],
+               rotulo1
+               )
+
+ggplot(influ_df_amostra_cluster) + 
+  geom_point(aes(x = hatvalue_, y=residuo_stud_, color = as.factor(result_knn)),alpha = 0.3) +
+       guides(color=guide_legend(title="Clusters"))
+```
+
+Aparentemente, realizar a clusterização e aplicar um kNN aos clusters e usar a predição do kNN como uma variável preditora da regressão logística reduziu as diferenças dentro da base de treino
+
+Para a modelagem, já sabemos que a amostra possui o *outlier*. Vamos removê-los antes da modelagem
+```{r}
+amostra_cluster[,cluster := NULL]
+amostra_cluster[,agnes_ := as.factor(rotulo1)]
+amostra_cluster[,index := NULL]
+
+#Removendo os outliers
+amostra_cluster_sem_outlier <- amostra_cluster[-amostra_cluster[,.I[puerpera_pre == 'sim' & sindrome_de_down_pre == 'sim']]]
+
+log_reg_clust <- glm(obito_pre ~ .,data = amostra_cluster_sem_outlier,family = "binomial")
+grafico_influencia(log_reg_clust,size = F)
+```
+Vejamos se isso trás ganhos na predição
+```{r}
+
+rotulo_teste <- lapply(seq(from=0,to=ceiling(nrow(teste)/50)),function(x){
+  #separando em amostras de 50
+  seq_treino = seq(from=1,to=50) + (50*x)
+  knn_prediction(dataset_treino = amostra_cluster[,-c("obito_pre","agnes_")],
+                 dataset_teste = teste[seq_treino,-c("obito_pre")],
+                 label = rotulo1)
+  })
+rotulo_teste_ <-unlist(rotulo_teste)[1:nrow(teste)]
+```
+
+Mesmo fazendo a adição dos clusters, o resultado ainda não foi tão satisfatório
+```{r}
+teste_cluster <- copy(teste)
+teste_cluster$agnes_ <- as.factor(rotulo_teste_)
+matriz_confusao(teste_cluster,log_reg_clust)
+```
+```{r}
+calcula_roc(df = teste_cluster,modelo = log_reg_clust)
+```
+
+
+## Análise das estatísticas básicas dos clusters
+Vamos avaliar separadamente os dados (uma análise exploratoria) dos grupos obtidos pelo DBScan
+
+```{r}
+ggplot(influ_df[(cluster != 0)]) + 
+  geom_point(aes(x = hatvalue_, y=residuo_stud_, color = as.factor(cluster)),alpha = 0.3) +
+    scale_color_manual(values = c(cores[5],cores[9],cores[1],cores[2],cores[3],cores[4])) +
+       guides(color=guide_legend(title="Clusters"))
+```
+```{r}
+describe_clusters <- function(df,rotulo,modelo,threshold = 0.5,by="cluster"){
+    df[,`:=`(cluster = as.factor(rotulo),
+             predicao  = factor(fifelse(predict(modelo,df,type = "response") > threshold,1,0),
+                                levels = c(0,1), 
+                                labels = c("vivo","morto"))),
+      ][,acertou := predicao == obito_pre]
+  
+    colunas_pre <- names(df)[grep("pre",names(df))]
+    #Removendo as colunas idade e obito
+    colunas_fator_considerar <- colunas_pre[which(colunas_pre != "idade_pre" & colunas_pre != "obito_pre")]
+    #vamos montar um dataset com as contagens de cada coluna
+    estatisticas_fator <- Reduce(f = function(x,y){
+                                          return(rbind(x,y))
+                                                  },
+                                 x = lapply(colunas_fator_considerar, function(x){
+                                      d <- dcast.data.table(data = df,
+                                                            formula = as.formula(paste(x,by,sep = " ~ ")),
+                                                            fun.aggregate = length)
+                                      names(d)[1] <- "variavel"
+                                      d[,variavel := paste(x,variavel,sep="_")]
+                                      return(d)
+                                 }))
+    
+    #Distribuição dos desfechos por cluster
+    volume_mortes <- dcast.data.table(data = df[,.N,by=c(by,'obito_pre')],
+                     formula = as.formula(paste("obito_pre",by,sep=" ~ ")),value.var = "N",fill=0)
+    
+    
+    names(volume_mortes)[1] <- "variavel"
+    volume_mortes[,variavel := paste("volume",variavel,sep="_")]
+    
+    
+    #Acuracia
+    acu <- dcast.data.table(data = df[,.N,by=c(by,"obito_pre","acertou")],
+                            formula = as.formula(paste("acertou + obito_pre",by,sep = " ~ ")),value.var = "N",fill=0)
+    acu[,variavel := paste(acertou,obito_pre,sep = "_"),
+       ][,`:=`(acertou=NULL,
+               obito_pre = NULL)]
+    
+    acu <- acu[,.SD,.SDcols = c(ncol(acu),1:(ncol(acu)-1))]
+    
+    #Estatísticas da idade
+    estatistica_idade <- dcast(melt(df[,.(idade_pre_media = mean(idade_pre),
+                                          idade_pre_desvio = sd(idade_pre)),by = by], 
+                                    id.vars = by,
+                                    variable.name = "variavel"), 
+                               variavel ~ cluster)
+    
+    
+    #dando o devido nome as colunas
+    names(estatistica_idade)[-1] <- paste0(by,sort(unique(rotulo)))
+    names(estatisticas_fator)[-1] <- paste0(by,sort(unique(rotulo)))
+    names(volume_mortes)[-1] <- paste0(by,sort(unique(rotulo)))
+    names(acu)[-1] <- paste0(by,sort(unique(rotulo)))
+    
+    
+    return(rbindlist(list(estatisticas_fator,volume_mortes,acu,estatistica_idade),use.names = T))
+    
+}
+
+descritivo <- describe_clusters(df = comorbidade_regressao_simples,
+                                rotulo = influ_df$cluster,
+                                modelo = log_reg)
+descritivo[,-c("cluster0"),
+           ][,.(variavel,`cluster-2`,`cluster-1`,cluster2, cluster1,cluster3,cluster4)]
+```
+```{r}
+#Percentual que compõe cada variável categórica para cada grupo
+descritivo_perc <- function(descr,
+                            ordem_colunas = NULL,
+                            df_original = comorbidade_regressao_simples,
+                            rotulos_clusters = comorbidade_regressao_simples$cluster){
+  
+  df_original[,cluster := as.factor(rotulos_clusters)]
+  df <- cbind(descr[,.(variavel)],
+              descr[,Map(function(x,y){round(100*x/y,2)},.SD,
+                      df_original[,.N,by=.(cluster),
+                                 ][order(cluster)]$N),.SDcols = -c("variavel")])
+  
+  if(!is.null(ordem_colunas)){
+    df <- df[,.SD,.SDcols = ordem_colunas]
+  }
+  
+  return (df)
+}
+
+descritivo_perc(descritivo,c("variavel","cluster-2","cluster-1","cluster2","cluster1","cluster3","cluster4"))
+
+```
+# Criação do modelo 2
+
+Pela análise acima, vemos que existe uma relação muito próxima do sexo entre os cluster -2 e 3 e -1 e 4. Dessa forma, façamos um teste e removamos eles do nosso modelo e vejamos novamente o gráfico de influência
+```{r}
+#O registro 17963 já é conhecido que deve ser errado. Fazendo uma nova busca, encontramos que o registro 17346 também está errado, pois foi registrado uma paciente com síndrome de down e puérpera. Portanto, vamos remover esses registros na atualização do modelo
+
+log_reg_sem_sexo <- update(log_reg,
+                           formula = obito_pre ~ . - puerpera_pre - cs_sexo_pre, 
+                           subset = -linhas_outlier)
+result <- grafico_influencia(log_reg_sem_sexo)
+influ_df2 <- result$df_influencia
+
+influ_df2[,`:=`(hatvalue_ = normalize(hatvalue),residuo_stud_ = normalize(residuo_stud))]
+ggplot(influ_df2) + geom_point(aes(x = hatvalue_, y=residuo_stud_),alpha = 0.3)
+```
+```{r}
+arm::binnedplot(log_reg_sem_sexo$fitted.values,residuals(log_reg_sem_sexo,type = "response"))
+```
+```{r}
+arm::binnedplot(comorbidade_regressao_simples[-linhas_outlier,]$idade_pre,residuals(log_reg_sem_sexo,type = "response"),nclass = 2000)
+```
+
+
+Com essa nova abordagem, removemos 2 clusters. Vejamos o comportamento desse modelo
+```{r}
+#Em cima dos dados de teste, tivemos uma pequena melhora nos resultados (61.5% -> 61.8%)
+matriz_confusao(teste,log_reg_sem_sexo)
+```
+```{r}
+calcula_roc(df = teste,modelo = log_reg_sem_sexo)
+```
+
+
+# Clusterização dos dados do gráfico de resíduo por influência
+Façamos o procedimento novamente, para tentar identificar esses 2 clusters extras
+```{r}
+
+db_result2 <- dbscan(x = as.matrix(influ_df2[,.(hatvalue_,residuo_stud_)]), eps = 0.0375)
+ggplot(influ_df2) + geom_point(aes(x = hatvalue_, y=residuo_stud_, color = as.factor(db_result2$cluster)),alpha = 0.3) +
+  guides(color=guide_legend(title="Cluster"))
+```
+```{r}
+influ_df2$cluster <- db_result2$cluster
+influ_df2[,cluster := as.factor(fifelse(cluster == 5,4,cluster))]
+ggplot(influ_df2) + geom_point(aes(x = hatvalue_, y=residuo_stud_, color = cluster),alpha = 0.3) +
+  guides(color=guide_legend(title="Cluster"))
+```
+```{r}
+descritivo2 <- describe_clusters(df = comorbidade_regressao_simples[-linhas_outlier,-c('puerpera_pre','cs_sexo_pre')],
+                                  rotulo = influ_df2$cluster,
+                                  modelo = log_reg_sem_sexo)
+descritivo2[,c("variavel","cluster1","cluster3","cluster4","cluster2")]
+```
+```{r}
+descritivo_perc(descr = descritivo2,ordem_colunas = c("variavel","cluster1","cluster3","cluster4","cluster2"),
+                df_original = comorbidade_regressao_simples[-linhas_outlier,-c('puerpera_pre','cs_sexo_pre')],
+                rotulos_clusters = influ_df2$cluster)
+```
+É notável também que existe uma diferença muito aparente da sindrome de down nos clusters: ambos os que destoam dos demais estão sendo enviesados, de alguma forma, pela sindrome de down. Vejamos a remoção dela
+```{r}
+# Agora sim, temos 2 nuvens bem parecidas
+log_reg3 <- update(log_reg_sem_sexo,
+                           formula = obito_pre ~ . - sindrome_de_down_pre, 
+                           subset = -linhas_outlier)
+result <- grafico_influencia(log_reg3)
+influ_df3 <- result$df_influencia
+
+influ_df3[,`:=`(hatvalue_ = normalize(hatvalue),residuo_stud_ = normalize(residuo_stud))]
+ggplot(influ_df3) + geom_point(aes(x = hatvalue_, y=residuo_stud_),alpha = 0.3)
+```
+```{r}
+influencePlot(log_reg3)
+```
+
+
+Vejamos o que obtemos de resultado a partir do modelo 3
+```{r}
+#Tivemos uma segunda melhoria no modelo, removendo a sindrome de down
+matriz_confusao(teste,log_reg3)
+```
+```{r}
+calcula_roc(df = teste,modelo = log_reg3)
+```
+
+# Melhoria do modelo por meio da análise de resíduos
+
+Pelo gráfico Binned, existem pontos que estão fora da margem de 95%, tanto para valores pequenos quanto para valores pequenos do predict quanto para valores grandes
+```{r}
+arm::binnedplot(log_reg3$fitted.values,residuals(log_reg3,type = "response"))
+```
+Vemos que ainda os resíduos parecem ter alguma relação com a idade.
+```{r}
+arm::binnedplot(comorbidade_regressao_simples[-linhas_outlier]$idade_pre,residuals(log_reg3,type = "response"),nclass = 10000)
+```
+
+Verifiquemos se a idade apresenta uma relação linear com a função logito, por meio do teste de Box-Tidwell (Hilbe, Joseph M - Logistic regression Model - 2009)
+```{r}
+#Primeiro, vamos criar um modelo que relaciona a variável de saída com a variável de entrada contínua (idade)
+#Como o teste irá inserir uma transformação logaritma na idade transformada e não será possível calcular para valores menores que 0,
+# necessitaremos fazer uma nova transformação, apenas alterando o centro
+#Criando um step para realizar a transformação
+preparacao_log <- function(x){
+  map(.x = x, ~ list(min = min(x)))
+}
+transformacao_center_min <- function(x,prep_output){
+  dados <- select(x, names(prep_output))
+  lista_resultado <- map2(.x = dados,.y = prep_output, .f = ~ .x - .y$min+0.01 )
+  return(lista_resultado)
+}
+
+pipe_tidwell <- pipeline %>%
+                  step_custom_transformation("idade_pre",
+                                             bake_function = transformacao_center_min,
+                                             prep_function = preparacao_log,
+                                             bake_how = "replace")
+
+log_reg_idade <- glm(data = pipe_tidwell%>%prep%>%bake(comorbidade_regressao_simples_total[index_treino]),
+                     formula = obito_pre ~ idade_pre,
+                     subset = -linhas_outlier,
+                     family =  binomial(link="logit"))
+summary(log_reg_idade)
+```
+```{r}
+#Agora, vamos criar uma variavel que vai ser a multiplicação entre a idade e o logaritmo da idade
+pipe_tidwell2 <- pipe_tidwell%>%
+                  step_mutate(idade_log = idade_pre * log(idade_pre))
+
+
+log_reg_idade <- glm(data = pipe_tidwell2%>%prep()%>%bake(comorbidade_regressao_simples_total[index_treino]),
+                     formula = obito_pre ~ idade_pre + idade_log,
+                     subset = -linhas_outlier,
+                     family =  binomial(link="logit"))
+summary(log_reg_idade)
+#Como a variável idade_log tem um coeficiente significativo, então a variável idade logaritmo é não linear
+```
+
+
+
+```{r}
+transformacao_log <- function(x,prep_output){
+  dados <- select(x, names(prep_output))
+  lista_resultado <- map2(.x = dados,.y = prep_output, .f = ~ log(.x - .y$min+0.01)  )
+  names(lista_resultado) <- "idade_log"
+  return(lista_resultado)
+}
+
+pipeline2 <- pipeline %>%
+              step_custom_transformation(idade_pre,
+                                         prep_function = preparacao_log,
+                                         bake_function = transformacao_log,
+                                         bake_how = "bind_cols")
+
+log_reg4 <- update(log_reg3,
+                   formula = update.formula(log_reg3$formula, . ~ . -idade_pre + idade_log),
+                   data =pipeline2%>%prep()%>%bake(comorbidade_regressao_simples_total[index_treino]))
+summary(log_reg4)
+```
+Houve uma piora
+```{r}
+matriz_confusao(pipeline2%>%
+                  prep()%>%
+                  bake(comorbidade_regressao_simples_teste),
+                log_reg4)
+```
+```{r}
+calcula_roc(df = pipeline2%>%
+                                    prep()%>%
+                                    bake(comorbidade_regressao_simples_teste),
+                              modelo = log_reg4)
+```
+
+```{r}
+transformacao_positiva <- function(x,prep_output){
+                                                  dados <- select(x, names(prep_output))
+                                                  map2(.x = dados,.y = prep_output, ~ .x - .y$min+0.01)
+}
+
+
+
+pipeline3 <- pipeline %>% step_custom_transformation("idade_pre",
+                                                     prep_function = preparacao_log,
+                                                     bake_function = transformacao_positiva,
+                                                     bake_how = "replace") %>%
+                            step_BoxCox("idade_pre")
+
+log_reg5 <- update(log_reg3,
+                   data =pipeline3%>%prep()%>%bake(comorbidade_regressao_simples_total[index_treino]))
+summary(log_reg5)
+```
+O resultado com o processamento usando BoxCox é bem similar ao resultado sem fazer a alteração na variável idade
+```{r}
+matriz_confusao(pipeline3%>%
+                  prep()%>%
+                  bake(comorbidade_regressao_simples_teste),
+                log_reg5)
+```
+```{r}
+
+calcula_roc(df = pipeline3%>%
+                    prep()%>%
+                    bake(comorbidade_regressao_simples_teste),
+            modelo = log_reg5)
+```
+
+```{r}
+db_result3 <- dbscan(x = as.matrix(influ_df3[,.(hatvalue_,residuo_stud_)]), eps = 0.0375)
+influ_df3$cluster <- db_result3$cluster
+
+ggplot(influ_df3) + geom_point(aes(x = hatvalue_, y=residuo_stud_,color = as.factor(cluster)),alpha = 0.3)
+```
+```{r}
+descritivo_perc(describe_clusters(comorbidade_regressao_simples[-linhas_outlier],db_result3$cluster,modelo = log_reg3),
+                df_original = comorbidade_regressao_simples[-linhas_outlier],rotulos_clusters = db_result3$cluster)
+```
+Vamos desconsiderar esses pontos influentes do treinamento
+```{r}
+log_reg6 <- update(log_reg,
+                   formula = obito_pre ~ . -cs_sexo_pre - puerpera_pre - sindrome_de_down_pre,
+                   data = comorbidade_regressao_simples[-linhas_outlier][-which(db_result3$cluster==0)])
+summary(log_reg6)
+```
+
+Não obtivemos melhorias, mesmo removendo os pontos "outliers" do gráfico de influência acima
+```{r}
+matriz_confusao(teste,log_reg6)
+```
+# Abordagem de múltiplos regressores
+Pelo gráfico de resíduos em função da variável idade, vimos que não conseguimos melhorar os resultados. Portanto, vamos separar em grupos os dados, com base na idade, tendo dessa forma, grupos com idades mais próximas entre si.
+A esperança nesse caso é que pessoas com idades mais próximas sejam mais parecidas entre si de tal forma que um modelo linear possa realizar a separação das classes e explicar bem o comportamento do grupo
+```{r}
+arm::binnedplot(comorbidade_regressao_simples[-linhas_outlier]$idade_pre,
+                                  residuals(log_reg3,type = "response"),
+                                  nclass = 10000)
+```
+
+
+```{r}
+lista_residuo_idade<-arm::binned.resids(comorbidade_regressao_simples[-linhas_outlier]$idade_pre,
+                                  residuals(log_reg3,type = "response"),
+                                  nclass = 10000)
+df_residuo_idade <- as.data.frame(lista_residuo_idade$binned)
+names(df_residuo_idade)[6] <- "se2"
+
+ggplot(df_residuo_idade) + geom_point(aes(x = xbar,y=ybar)) +
+      geom_line(aes_string(x = "xbar", y = "se2"),color="gray") + 
+      geom_line(aes_string(x = "xbar", y = "- se2"),color="gray") + 
+      xlab("idade_pre") + ylab("Resíduo médio") + 
+      geom_vline(aes(xintercept = -1.5),linetype = "dashed") + 
+      geom_vline(aes(xintercept = 1.5),linetype = "dashed")+
+      geom_rect(aes(xmin = -3.2, xmax = -1.5,ymin = -0.75, ymax = 0.75),alpha=0.002) + 
+      geom_rect(aes(xmin = -1.5, xmax = 1.5,ymin = -0.75, ymax = 0.75),alpha=0.002,fill = "red") + 
+      geom_rect(aes(xmin = 1.5, xmax = 3,ymin = -0.75, ymax = 0.75),alpha=0.002,fill = "blue") +
+      theme(panel.background = element_blank(),axis.line.x = element_line(),axis.line.y = element_line())
+```
+Vamos preparar as bases de treino
+```{r}
+limites_idade <- c(-1.5,1.5)
+df_cinza = comorbidade_regressao_simples[-linhas_outlier][idade_pre < limites_idade[1]]
+df_vermelho = comorbidade_regressao_simples[-linhas_outlier][idade_pre >= limites_idade[1] & idade_pre <= limites_idade[2]]
+df_azul = comorbidade_regressao_simples[-linhas_outlier][idade_pre > limites_idade[2]]
+```
+
+```{r}
+ggplot(rbind(df_cinza%>%mutate(grupo = "cinza"),
+      df_vermelho%>%mutate(grupo = "vermelho"),
+      df_azul%>%mutate(grupo = "azul"))%>%group_by(grupo,obito_pre)%>%summarise(n=n())%>%mutate(freq = n / sum(n))) +
+    geom_col(aes(x = obito_pre,y = freq)) + 
+    facet_wrap("grupo")
+```
+
+
+```{r}
+log_reg_cinza <- update(log_reg3,data = df_cinza)
+log_reg_vermelho <- update(log_reg3,data = df_vermelho)
+log_reg_azul <- update(log_reg3,data = df_azul)
+```
+
+```{r}
+arm::binnedplot(x=fitted(log_reg_cinza),y=residuals(log_reg_cinza,type = "response"),nclass = 80)
+```
+
+```{r}
+arm::binnedplot(x=fitted(log_reg_vermelho),y=residuals(log_reg_vermelho,type = "response"),nclass = 80)
+```
+
+
+
+```{r}
+arm::binnedplot(x=fitted(log_reg_azul),y=residuals(log_reg_azul,type = "response"),nclass = 80)
+```
+
+
+
+```{r}
+matriz_confusao(pipeline%>%prep()%>%bake(comorbidade_regressao_simples_teste)%>%filter(idade_pre < limites_idade[1]),
+                modelo = log_reg_cinza)
+
+calcula_roc(pipeline%>%prep()%>%bake(comorbidade_regressao_simples_teste)%>%filter(idade_pre < limites_idade[1]),
+            modelo = log_reg_cinza)
+```
+
+
+```{r}
+matriz_confusao(pipeline%>%prep()%>%bake(comorbidade_regressao_simples_teste)%>%
+                    filter(idade_pre >= limites_idade[1] & idade_pre <= limites_idade[2]),
+                modelo = log_reg_vermelho)
+
+calcula_roc(pipeline%>%prep()%>%bake(comorbidade_regressao_simples_teste)%>%
+                    filter(idade_pre >= limites_idade[1] & idade_pre <= limites_idade[2]),modelo = log_reg_vermelho)
+```
+```{r}
+matriz_confusao(pipeline%>%prep()%>%bake(comorbidade_regressao_simples_teste)%>%
+                    filter(idade_pre > limites_idade[2]),
+                modelo = log_reg_azul)
+
+calcula_roc(pipeline%>%prep()%>%bake(comorbidade_regressao_simples_teste)%>%
+                    filter(idade_pre > limites_idade[2]),modelo = log_reg_azul)
+```
+
+Geral
+```{r}
+predict_modelo3_1 <- function(x){
+  dado_teste_modelo3_1 <- copy(x)
+
+  #Todas as predicoes
+  dado_teste_modelo3_1$pred_azul <- predict(log_reg_azul,dado_teste_modelo3_1,type = "response")
+  dado_teste_modelo3_1$pred_cinza <- predict(log_reg_cinza,dado_teste_modelo3_1,type = "response")
+  dado_teste_modelo3_1$pred_vermelho <- predict(log_reg_vermelho,dado_teste_modelo3_1,type = "response")
+  
+  result3_1 <- dado_teste_modelo3_1%>%mutate(pred = fifelse(idade_pre < limites_idade[1], 
+                                               pred_cinza,
+                                               fifelse(idade_pre > limites_idade[2], 
+                                                       pred_azul,
+                                                       pred_vermelho)))
+  return(result3_1$pred)
+}
+
+
+
+calcula_roc_true_pred <- function(y_true,y_pred){     
+  pr <- prediction(predictions = y_pred, 
+                   labels = y_true,
+                   label.ordering = c("vivo","morto"))
+  
+  prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+  
+  auc <- performance(pr, measure = "auc")
+  print(paste("AUC = ",round(auc@y.values[[1]],3),sep=" "))
+  plot(prf)
+}
+
+dados_teste <- pipeline%>%prep()%>%bake(comorbidade_regressao_simples_teste)
+pred <- predict_modelo3_1(dados_teste)
+confusionMatrix(data = factor(as.integer(pred> 0.5),levels = c(0,1), labels = c("vivo","morto")),
+                reference = dados_teste$obito_pre,
+                positive = "morto",
+                mode = "everything")
+
+calcula_roc_true_pred(y_pred = pred, y_true = dados_teste$obito_pre)
+
+```
+
+
+# Referências interessantes
+https://bbolker.github.io/stat4c03/notes/logistic.pdf
+https://stats.stackexchange.com/questions/166585/pearson-vs-deviance-residuals-in-logistic-regression
+
+
+# Coisas a fazer
+Metricas para usar para avaliar a colianearidade entre as variaveis
+
+'klPQ', 'klQP', 'hellinger', 'jensen-shannon'
+'bhattacharya'
+pyAgrum
+
+
+fscore
+curva ROC
+
+ncd - complearn
+
+
+separar os obito e nao obito e extratos de idades e fazer as matrizes de distancia
